@@ -2,6 +2,11 @@
 
 What changed in the app, newest first. Each release's notes on GitHub list what it added.
 
+## 2026-10-27
+
+### Interview prep
+- One page per company, built when a role is marked Interviewing, with a debrief that can add lines to the impact record
+
 ## 2026-10-26
 
 ### Finding jobs

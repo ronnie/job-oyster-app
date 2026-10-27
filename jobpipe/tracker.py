@@ -378,7 +378,11 @@ class LocalTracker:
                     continue
                 values = {k: r.get(k, "") if k != "fit" else r.get("fit") for k in FROM_NOTION}
                 values["resume_files"] = _file_names(r.get("resume_files"))
-                if not row["dirty_status"]:       # an unsent status set here wins over Notion's
+                # An unsent status set here wins over Notion's. The check is repeated in the write: a status set
+                # after this read (Interviewing, then Denied a moment later) must not be replaced by the copy this
+                # sync already fetched.
+                take_status = not row["dirty_status"]
+                if take_status:
                     values["status"] = r["status"]
                     values["applied"] = _applied(r["status"], row["applied"])
                     values["reached"] = _reach(row["reached"], r["status"])
@@ -389,7 +393,8 @@ class LocalTracker:
                         del values[k]
                 if key:
                     values["url_key"] = key
-                con.execute(f"UPDATE tracker SET notion_page_id = ?, {', '.join(k + ' = ?' for k in values)} WHERE id = ?",
+                where = "id = ? AND dirty_status = 0" if take_status else "id = ?"
+                con.execute(f"UPDATE tracker SET notion_page_id = ?, {', '.join(k + ' = ?' for k in values)} WHERE {where}",
                             (r["page_id"], *values.values(), row["id"]))
             # A row that was in Notion and is gone from it was deleted there, unless it still has something to send.
             # An entirely empty answer is not trusted to mean "everything was deleted".

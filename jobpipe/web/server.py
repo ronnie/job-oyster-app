@@ -33,7 +33,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import config
 from ..config import Config
-from .. import formats, jd, onboarding, own_formats, pinned, record_import, regions, render, resume_import
+from .. import formats, interview_prep, jd, onboarding, own_formats, pinned, record_import, regions, render, resume_import
 from .. import hiringcafe as hc
 from . import about, follow
 from .flow import application_flow
@@ -59,10 +59,11 @@ STATIC = Path(__file__).parent / "static"
 IMPACT_SNAPSHOT_EVERY = 600     # seconds
 IMPACT_SNAPSHOTS = 50
 
-# What the Interview prep tab starts with. Claude adds to it on request, under these headings.
+# What the Interview prep notes page starts with. A company you're interviewing with has its own page
+# (interview_prep.Pages); Claude adds to either one on request, under these headings.
 INTERVIEW_PREP_STARTER = """# Interview prep
 
-Stories to find, examples to dig up and questions to get ready for. Write here, or ask Claude to add something and it goes in this file.
+Notes that aren't about one company: stories to find, examples to dig up, questions to get ready for. A company you're interviewing with has its own page, built when you mark the role Interviewing. Write here, or ask Claude to add something and it goes in this file.
 
 ## Stories to find
 
@@ -179,11 +180,12 @@ def create_app(cfg: Config, *, token: str, store: Optional[Store] = None,
     hiringcafe = hiringcafe or hc.HiringCafe()      # reads a share link when a search is added
     searches_path = searches_path or config.searches_path()
     impact_path = impact_path or config.REFERENCES / "impact-record.md"
-    prep_path = prep_path or store.root / "interview-prep.md"   # personal notes, in the profile's data/
+    prep_path = prep_path or store.root / "interview-prep.md"   # notes that aren't about one company
+    prep_pages = interview_prep.Pages(store.root)              # one markdown page per company
     allowed = allowed_hosts or {"127.0.0.1", "localhost"}
     app = FastAPI(title="jobpipe", docs_url=None, redoc_url=None, openapi_url=None)
     state: dict[str, Any] = {"runner": None, "edit_locks": {}, "reports": {}, "chatting": set(),
-                             "chat_runners": {}, "model_lists": {}}
+                             "chat_runners": {}, "model_lists": {}, "prep_building": set()}
     # The tracker lives in data/tracker.db. Given a NotionTracker (or none), it is wrapped here; the first
     # run starts from the last Notion snapshot the app saved, so nothing tracked is lost in the move.
     local = tracker if isinstance(tracker, LocalTracker) else LocalTracker(
@@ -506,6 +508,13 @@ def create_app(cfg: Config, *, token: str, store: Optional[Store] = None,
                     pass            # no résumé in the app for it; the job shows "No résumé on file"
         keeper.kick()
         sync.kick()
+        if body.get("status") in ("Interviewing", "Offer"):
+            # The interview pack is built from the posting, the gaps and the résumé just kept. Offer covers a role
+            # that skipped the Interviewing stage. A pack already written is left as it is. Queued after the
+            # status is sent, so the pack's files don't hold up the sync of this change.
+            row = board.by_tracker(row_id)
+            if row:
+                schedule_prep(row)
         return {"ok": True}
 
     @app.get("/api/tracker/settings")
@@ -2280,6 +2289,275 @@ def create_app(cfg: Config, *, token: str, store: Optional[Store] = None,
 
     read_impact, write_impact, impact_payload = markdown_doc("impact-record", impact_path, "impact record")
     markdown_doc("interview-prep", prep_path, "interview prep", allow_empty=True, starter=INTERVIEW_PREP_STARTER)
+
+    # ---- interview prep: one page per company, a pack per role (interview_prep.py) ----------------------
+    # Marking a role Interviewing (or Offer, if it skipped that stage) builds the pack in the background from
+    # the posting, the gaps and the résumé sent. The notes page above is unchanged. Confirmed debrief lines
+    # go into the impact record the same way a setup interview's lines do.
+    def prep_slug(slug_s: str) -> str:
+        if not interview_prep.valid_slug(slug_s):
+            raise HTTPException(404, "Unknown interview prep page.")
+        return slug_s
+
+    def prep_payload(slug_s: str, text: Optional[str] = None) -> dict:
+        path = prep_pages.path(slug_s)
+        text = prep_pages.read(slug_s) if text is None else text
+        return {"markdown": text, "version": doc_version(text), "path": str(path),
+                "updated": path.stat().st_mtime if path.exists() else None}
+
+    def prep_sources(row: dict) -> dict:
+        """The posting, the gaps and the résumé sent for one tracked role. Whatever isn't on file is empty."""
+        jid = row.get("id") or ""
+        st = board.state().get(jid) or {}
+        job = store.job(jid) if jid else {}
+        posting = (job.get("description") or "").strip()
+        run_dir = local_path(st.get("run_dir") or st.get("analysis_dir"))
+        if not posting and run_dir and (run_dir / "jd.md").is_file():
+            posting = (run_dir / "jd.md").read_text()
+        gaps: list[str] = []
+        for g in (st.get("triage") or {}).get("likely_gaps") or []:
+            g = str(g).strip()
+            if g and g not in gaps:
+                gaps.append(g)
+        if run_dir and (run_dir / "04-match.md").is_file():
+            from ..tailor import unconfirmed_gaps
+            for g in unconfirmed_gaps((run_dir / "04-match.md").read_text()):
+                if g and g not in gaps:
+                    gaps.append(g)
+        resume_name, resume = "", ""
+        if row.get("tracker_id"):
+            info, _names = sent_info(row)
+            if info and info.get("path"):
+                resume_name = info.get("title") or info.get("name") or ""
+                resume = _pdf_text(Path(info["path"]))
+        if not resume and run_dir and (run_dir / "resume-final.md").is_file():
+            resume_name = resume_name or "the résumé in the app"
+            resume = (run_dir / "resume-final.md").read_text()
+        return {"posting": posting, "gaps": gaps, "resume": resume, "resume_name": resume_name}
+
+    def _pdf_text(path: Path) -> str:
+        try:
+            from pypdf import PdfReader
+            return "\n".join(pg.extract_text() or "" for pg in PdfReader(str(path)).pages).strip()
+        except Exception:  # noqa: BLE001 - a résumé that won't open still leaves the rest of the pack
+            return ""
+
+    def schedule_prep(row: dict, force: bool = False) -> Optional[dict]:
+        """Start a pack for this role unless one is already written (or one is being written). Returns its place."""
+        company = (row.get("company") or "").strip() or "Unknown"
+        title = (row.get("title") or "").strip()
+        if not title:
+            return None
+        slug_s, key = interview_prep.company_slug(company), interview_prep.role_key(company, title)
+        with prep_pages.lock:
+            if key in state["prep_building"]:
+                return {"slug": slug_s, "key": key, "state": "building"}
+            index = prep_pages.read_index()
+            entry = index.setdefault(slug_s, {"company": company, "roles": {}})
+            entry["company"] = entry.get("company") or company
+            role = entry["roles"].get(key) or {}
+            ready = role.get("state") == "ready" and prep_pages.has_role(slug_s, key, role.get("title") or title)
+            if ready and not force:
+                return {"slug": slug_s, "key": key, "state": "ready"}
+            if role.get("state") == "error" and not force:
+                return {"slug": slug_s, "key": key, "state": "error", "error": role.get("error") or ""}
+            # Left at "building" by a restart: start it again. A rebuild leaves the pack that's there until the new one.
+            entry["roles"][key] = {**role, "title": title, "job_id": row.get("id") or "",
+                                   "tracker_id": row.get("tracker_id") or "", "state": "building", "error": "",
+                                   "added": int(role.get("added") or 0), "built": role.get("built") or "",
+                                   "sources": role.get("sources") or ""}
+            prep_pages.write_index(index)
+            if not ready:
+                page = prep_pages.read(slug_s) or f"# {company}\n"
+                if not interview_prep.role_section(page, key, title):
+                    prep_pages.write(slug_s, interview_prep.upsert_role(
+                        page, company, key, title, interview_prep.placeholder(title)))
+            state["prep_building"].add(key)
+        threading.Thread(target=_build_prep, args=(slug_s, key, company, title, dict(row)), daemon=True).start()
+        return {"slug": slug_s, "key": key, "state": "building"}
+
+    def _finish_prep(slug_s: str, key: str, *, state_: str, error: str = "", sources: str = "", markdown: str = "",
+                     company: str = "", title: str = "") -> None:
+        with prep_pages.lock:
+            index = prep_pages.read_index()
+            entry = index.get(slug_s) or {"company": company, "roles": {}}
+            role = entry["roles"].get(key) or {"title": title}
+            # A failed rebuild leaves the pack that's already there; the first build still gets the fallback.
+            page = prep_pages.read(slug_s) or f"# {entry.get('company') or company}\n"
+            have = interview_prep.role_section(page, key, role.get("title") or title)
+            if markdown and not (state_ == "error" and "### Likely questions" in have):
+                prep_pages.write(slug_s, interview_prep.upsert_role(
+                    page, entry.get("company") or company, key, role.get("title") or title, markdown))
+            role.update(state=state_, error=error[:200], sources=sources or role.get("sources") or "",
+                        built=now_iso() if state_ == "ready" else role.get("built") or "")
+            entry["roles"][key] = role
+            index[slug_s] = entry
+            prep_pages.write_index(index)
+            state["prep_building"].discard(key)
+
+    def _build_prep(slug_s: str, key: str, company: str, title: str, row: dict) -> None:
+        async def work() -> None:
+            from ..pipeline import make_runner
+            src = prep_sources(row)
+            runner = (runner_factory or make_runner)(cfg)
+            cand = config.candidate()
+            built = await interview_prep.build_pack(
+                runner, cfg.chat_model, company=company, title=title, posting=src["posting"], gaps=src["gaps"],
+                resume=src["resume"], resume_name=src["resume_name"], record=read_impact(),
+                brief=cand.personalize(interview_prep.PACK_BRIEF))
+            _finish_prep(slug_s, key, state_="ready" if built["ok"] else "error", error=built["error"],
+                         sources=built["sources"], markdown=built["markdown"], company=company, title=title)
+        try:
+            asyncio.run(work())
+        except Exception as e:  # noqa: BLE001 - the status change already succeeded; the page says why
+            err = str(e).splitlines()[0][:200] if str(e) else "no reply"
+            src_line = interview_prep.source_line(date.today(), posting=False, gaps=0, resume_name="")
+            try:
+                _finish_prep(slug_s, key, state_="error", error=err, sources=src_line,
+                             markdown=interview_prep.fallback(title, src_line, [], err), company=company, title=title)
+            except Exception:  # noqa: BLE001 - the profile folder went away with the build
+                state["prep_building"].discard(key)
+
+    def prep_public() -> dict:
+        """The notes page, then one entry per company. A role at Interviewing or Offer with no pack is started."""
+        for row in board.rows():
+            if row.get("status") in ("Interviewing", "Offer") and row.get("tracker_id"):
+                schedule_prep(row)
+        index = prep_pages.read_index()
+        pages = [{"slug": "", "kind": "notes", "company": "Notes", "path": str(prep_path), "roles": []}]
+        slugs = set(index)
+        if prep_pages.companies.exists():
+            slugs |= {p.stem for p in prep_pages.companies.glob("*.md") if interview_prep.valid_slug(p.stem)}
+        for slug_s in sorted(slugs, key=lambda s: (index.get(s, {}).get("company") or s).lower()):
+            entry = index.get(slug_s) or {}
+            company = entry.get("company") or ""
+            if not company:
+                text = prep_pages.read(slug_s)
+                m = re.search(r"^#\s+(.+?)\s*$", text, re.M)
+                company = (m.group(1).strip() if m else slug_s)
+            roles = []
+            for key, role in (entry.get("roles") or {}).items():
+                roles.append({"key": key, "title": role.get("title") or "", "job_id": role.get("job_id") or "",
+                              "tracker_id": role.get("tracker_id") or "", "state": role.get("state") or "",
+                              "error": role.get("error") or "", "built": role.get("built") or "",
+                              "sources": role.get("sources") or "", "added": int(role.get("added") or 0)})
+            pages.append({"slug": slug_s, "kind": "company", "company": company,
+                          "path": str(prep_pages.path(slug_s)), "roles": roles})
+        return {"pages": pages}
+
+    @app.get("/api/interview-prep/pages")
+    def interview_prep_pages():
+        return prep_public()
+
+    @app.post("/api/interview-prep/ensure")
+    def interview_prep_ensure(body: dict):
+        """Build this tracked role's pack if it doesn't have one. {"tracker_id", "force"?}."""
+        row = board.by_tracker(str(body.get("tracker_id") or ""))
+        if not row:
+            raise HTTPException(404, "That job isn't in the tracker.")
+        if not (row.get("title") or "").strip():
+            raise HTTPException(400, "That role has no title.")
+        found = schedule_prep(row, force=bool(body.get("force")))
+        if not found:
+            raise HTTPException(400, "That role has no title.")
+        return found
+
+    @app.get("/api/interview-prep/companies/{slug}")
+    def get_company_prep(slug: str):
+        slug = prep_slug(slug)
+        if not prep_pages.known(slug):
+            raise HTTPException(404, "Unknown interview prep page.")
+        return prep_payload(slug)
+
+    @app.put("/api/interview-prep/companies/{slug}")
+    def save_company_prep(slug: str, body: dict):
+        """Save one company's page. `version` is the one the edit started from; a different one on disk is a 409."""
+        slug = prep_slug(slug)
+        if not prep_pages.known(slug):
+            raise HTTPException(404, "Unknown interview prep page.")
+        text = body.get("markdown")
+        if not isinstance(text, str):
+            raise HTTPException(400, "The interview prep can't be saved.")
+        with prep_pages.lock:    # a pack landing between the check and the write would be lost
+            current = prep_pages.read(slug)
+            if doc_version(current) != body.get("version") and not body.get("force"):
+                return JSONResponse({"detail": "The interview prep was changed outside this window since you opened it.",
+                                     "current": prep_payload(slug, current)}, status_code=409)
+            prep_pages.write(slug, text, current)
+            return prep_payload(slug, text)
+
+    @app.post("/api/interview-prep/companies/{slug}/preview")
+    def preview_company_prep(slug: str, body: dict):
+        prep_slug(slug)
+        return {"html": md_html(str(body.get("markdown") or ""))}
+
+    @app.post("/api/interview-prep/companies/{slug}/build")
+    def rebuild_company_prep(slug: str, body: dict):
+        """Write this role's pack again. The rest of the company's page is kept."""
+        slug = prep_slug(slug)
+        key = str(body.get("key") or "")
+        entry = prep_pages.read_index().get(slug) or {}
+        role = (entry.get("roles") or {}).get(key)
+        if not role:
+            raise HTTPException(404, "That role has no interview pack.")
+        row = board.row(role.get("job_id") or "") or board.by_tracker(role.get("tracker_id") or "")
+        if not row:
+            raise HTTPException(404, "That role isn't in the tracker anymore.")
+        return schedule_prep(row, force=True)
+
+    @app.post("/api/interview-prep/companies/{slug}/debrief")
+    async def debrief_company_prep(slug: str, body: dict):
+        """Lines the debrief notes support, for you to check. The notes are what's saved under ### Debrief."""
+        slug = prep_slug(slug)
+        key = str(body.get("key") or "")
+        entry = prep_pages.read_index().get(slug) or {}
+        role = (entry.get("roles") or {}).get(key)
+        if not role:
+            raise HTTPException(404, "That role has no interview pack.")
+        notes = interview_prep.debrief_notes(interview_prep.role_section(
+            prep_pages.read(slug), key, role.get("title") or ""))
+        if not notes:
+            raise HTTPException(400, "Write what they asked and what you said under Debrief, then draft the lines.")
+        cand = config.candidate()
+        try:
+            lines = await interview_prep.draft_debrief(
+                get_runner(), cfg.chat_model, company=entry.get("company") or slug, title=role.get("title") or "",
+                notes=notes, brief=cand.personalize(interview_prep.DEBRIEF_BRIEF))
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"Your AI didn't answer: {str(e).splitlines()[0][:200] if str(e) else 'no reply'}") from None
+        return {"lines": lines, "version": doc_version(read_impact())}
+
+    @app.post("/api/impact-record/debrief-apply")
+    def debrief_apply(body: dict):
+        """Add the lines you kept from a debrief ({"slug", "key", "lines"}) to "From your interviews".
+        `version` is the record the app has open; a different one on disk is a 409."""
+        slug = prep_slug(str(body.get("slug") or ""))
+        key = str(body.get("key") or "")
+        entry = prep_pages.read_index().get(slug) or {}
+        role = (entry.get("roles") or {}).get(key)
+        if not role:
+            raise HTTPException(404, "That role has no interview pack.")
+        lines = [str(x)[:600] for x in body.get("lines") or [] if str(x).strip()]
+        if not lines:
+            raise HTTPException(400, "Tick at least one line to add.")
+        current = read_impact()
+        if doc_version(current) != body.get("version"):
+            return JSONResponse({"detail": "The impact record was changed outside this window since you opened it.",
+                                 "current": impact_payload(current)}, status_code=409)
+        new = record_import.apply(current, entry.get("company") or slug, role.get("title") or "", "", lines,
+                                  "the interview debrief", date.today(), section=onboarding.INTERVIEW_SECTION,
+                                  intro=onboarding.INTERVIEW_INTRO)
+        if new == current:
+            raise HTTPException(400, "Those lines are in your impact record already.")
+        write_impact(new, current)
+        state["runner"] = None
+        with prep_pages.lock:
+            index = prep_pages.read_index()
+            role = index.get(slug, {}).get("roles", {}).get(key)
+            if role is not None:
+                role["added"] = int(role.get("added") or 0) + len(lines)
+                prep_pages.write_index(index)
+        return impact_payload(new)
 
     # ---- confirmed facts: answers to follow-up questions, kept in the impact record ---------------------
     @app.post("/api/impact-record/facts")

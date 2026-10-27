@@ -34,8 +34,8 @@ MAX_ZIP = 50 * 1024 * 1024          # the export with messages can be large; onl
 MAX_CSV = 5 * 1024 * 1024
 QUESTIONS = 6                       # the most an interview asks before it drafts
 INTERVIEW_SECTION = "From your interviews"
-INTERVIEW_INTRO = ("Lines from the setup interviews, each put here after you checked it. They count as evidence like "
-                   "the rest of this record; edit or move them as you like.")
+INTERVIEW_INTRO = ("Lines from the setup interviews and from interview debriefs, each put here after you checked it. "
+                   "They count as evidence like the rest of this record; edit or move them as you like.")
 
 
 class ExportError(ValueError):

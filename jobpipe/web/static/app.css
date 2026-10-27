@@ -778,6 +778,17 @@ details.pcard[open] summary { margin-bottom: 10px; }
 .profile .run-bar { margin: auto -24px 0; }
 .profile .form-error { margin: 0; }
 
+/* interview prep: the notes page, and one page per company */
+.prep-pages { display: flex; gap: 6px; padding: 10px 16px 0; overflow-x: auto; flex: none; background: var(--panel); }
+.prep-pages:empty { display: none; }
+.prep-pages button { flex: none; border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding: 4px 12px; font-size: 13px; color: var(--ink); }
+.prep-pages button.on { border-color: var(--accent); background: var(--sel); font-weight: 600; }
+.prep-pages button small { color: var(--muted); font-weight: 400; }
+.prep-debrief { padding: 10px 16px 12px; border-bottom: 1px solid var(--line); background: var(--panel); flex: none; display: flex; flex-direction: column; gap: 10px; }
+.prep-role { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.prep-role .grow { flex: 1; min-width: 200px; }
+.prep-role p { margin: 2px 0 0; font-size: 13px; }
+
 /* markdown documents: impact record, interview prep */
 #tab-impact, #tab-prep { flex-direction: column; }
 .doc { display: flex; flex-direction: column; flex: 1; min-height: 0; }

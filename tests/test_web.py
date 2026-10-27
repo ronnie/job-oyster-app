@@ -2415,3 +2415,114 @@ def test_setup_wizard_stays_shut_for_a_saved_profile(env):
     assert c.put("/api/profile", headers=H, json={**prof["candidate"], "name": "Sam Lee"}).json()["example"] is False
     s = c.get("/api/setup", headers=H).json()
     assert s["show"] is False and s["state"] == ""             # not finished, but not forced on someone set up already
+
+
+PACK_MD = """### Likely questions
+
+- How did the payments migration go?
+  - Story: Northwind, "Led 22 teams."
+
+### Stories to cite
+
+- Northwind: "Led 22 teams."
+
+### Questions to ask them
+
+- Who owns the on-call rotation?
+
+### Debrief
+
+Prompt.
+"""
+
+
+class PrepRunner:
+    """The interview pack and the debrief draft. Anything else is a surprise."""
+    def __init__(self):
+        self.calls = []
+
+    async def run(self, call):
+        self.calls.append(call)
+        if call.label == "interview-prep":
+            return AgentResult(files={"pack.md": PACK_MD}, summary="")
+        if call.label == "interview-debrief":
+            return AgentResult(files={"lines.md": "- Cut onboarding from 6 weeks to 2.\n- Saved $400K.\n"}, summary="")
+        raise AssertionError(call.label)
+
+
+def _prep_role(c, slug, key):
+    last = None
+    for _ in range(100):
+        pages = {p["slug"]: p for p in c.get("/api/interview-prep/pages", headers=H).json()["pages"]}
+        role = next((r for r in pages.get(slug, {}).get("roles", []) if r["key"] == key), None)
+        last = (role, pages)
+        if role and role["state"] in ("ready", "error"):
+            return role, pages
+        time.sleep(0.05)
+    raise AssertionError(last)
+
+
+def test_interviewing_builds_a_company_page_and_the_debrief_fills_the_record(env, tmp_path):
+    env["store"].update("j1", triage={"fit_score": 8, "one_line": "good", "band_reason": "b", "level_match": "match",
+                                      "hard_requirement_issues": [], "strongest_matches": ["m"],
+                                      "likely_gaps": ["AI evaluation depth"], "recommended_base": "x", "role_family": "TPM"})
+    (env["run_dir"] / "04-match.md").write_text("# Match\n\n## Unconfirmed gaps\n- Owns the on-call rotation\n")
+    runner = PrepRunner()
+    c = TestClient(create_app(env["cfg"], token=TOKEN, store=env["store"], tracker=env["tracker"],
+                              runner_factory=lambda cfg: runner, runs=env["runs"], allowed_hosts={"testserver"},
+                              searches_path=env["searches"], resume_root=tmp_path / "repo", impact_path=env["impact"]))
+    assert c.get("/api/jobs?wait=1", headers=H).status_code == 200
+    notes_before = c.get("/api/interview-prep", headers=H).json()["markdown"]
+    assert c.post("/api/tracker/p1/status", headers=H, json={"status": "Interviewing"}).json() == {"ok": True}
+    role, pages = _prep_role(c, "acme", "acme-staff-technical-program-manager")
+    assert role["state"] == "ready" and role["error"] == ""
+    assert pages[""]["kind"] == "notes" and pages["acme"]["company"] == "Acme"
+    page = c.get("/api/interview-prep/companies/acme", headers=H).json()
+    assert page["markdown"].startswith("# Acme\n") and "## Staff Technical Program Manager" in page["markdown"]
+    assert "2 gaps" in page["markdown"] and "the posting" in page["markdown"] and "résumé sent" in page["markdown"]
+    assert "Led 22 teams." in page["markdown"] and "that quote isn't" not in page["markdown"]
+    assert "posting.md" in runner.calls[0].documents and "AI evaluation depth" in runner.calls[0].documents["gaps.md"]
+    assert "Owns the on-call rotation" in runner.calls[0].documents["gaps.md"]
+    assert "Technical Program Manager" in runner.calls[0].documents["sent-resume.md"]
+    assert c.get("/api/interview-prep", headers=H).json()["markdown"] == notes_before
+
+    # A note beside the pack, and a second save refused once the page moved.
+    edited = "A note of mine.\n\n" + page["markdown"]
+    saved = c.put("/api/interview-prep/companies/acme", headers=H, json={"markdown": edited, "version": page["version"]}).json()
+    assert saved["markdown"].startswith("A note of mine.")
+    assert c.put("/api/interview-prep/companies/acme", headers=H,
+                 json={"markdown": "nope\n", "version": page["version"]}).status_code == 409
+    assert c.get("/api/interview-prep/companies/nope", headers=H).status_code == 404
+    assert c.get("/api/interview-prep/companies/Nope", headers=H).status_code == 404
+
+    # Build again replaces the pack and leaves the note.
+    assert c.post("/api/interview-prep/companies/acme/build", headers=H, json={"key": role["key"]}).json()["state"] == "building"
+    role, _ = _prep_role(c, "acme", role["key"])
+    assert role["state"] == "ready"
+    rebuilt = c.get("/api/interview-prep/companies/acme", headers=H).json()["markdown"]
+    assert rebuilt.startswith("A note of mine.") and rebuilt.count("## Staff Technical Program Manager") == 1
+
+    # The debrief: what you wrote under Debrief, then the lines you tick, go into the impact record.
+    from jobpipe.interview_prep import DEBRIEF_NOTE
+    notes = rebuilt.replace(DEBRIEF_NOTE, DEBRIEF_NOTE + "\n\nThey asked about onboarding. I cut it from 6 weeks to 2.", 1)
+    assert c.put("/api/interview-prep/companies/acme", headers=H, json={
+        "markdown": notes, "version": c.get("/api/interview-prep/companies/acme", headers=H).json()["version"]}).status_code == 200
+    empty = c.post("/api/interview-prep/companies/acme/debrief", headers=H, json={"key": "missing"})
+    assert empty.status_code == 404
+    drafted = c.post("/api/interview-prep/companies/acme/debrief", headers=H, json={"key": role["key"]}).json()
+    assert [(l["text"], l["ok"]) for l in drafted["lines"]] == [("Cut onboarding from 6 weeks to 2.", True), ("Saved $400K.", False)]
+    stale = c.post("/api/impact-record/debrief-apply", headers=H,
+                   json={"slug": "acme", "key": role["key"], "lines": ["Cut onboarding from 6 weeks to 2."], "version": "old"})
+    assert stale.status_code == 409
+    rec = c.post("/api/impact-record/debrief-apply", headers=H,
+                 json={"slug": "acme", "key": role["key"], "lines": ["Cut onboarding from 6 weeks to 2."],
+                       "version": drafted["version"]}).json()
+    assert "# From your interviews" in rec["markdown"] and "the interview debrief" in rec["markdown"]
+    assert "## Acme, Staff Technical Program Manager" in rec["markdown"] and rec["markdown"] == env["impact"].read_text()
+    added = next(r for r in c.get("/api/interview-prep/pages", headers=H).json()["pages"] if r["slug"] == "acme")
+    assert added["roles"][0]["added"] == 1
+    # Marking it Offer does not write the pack over again.
+    calls = len(runner.calls)
+    assert c.post("/api/tracker/p1/status", headers=H, json={"status": "Offer"}).json() == {"ok": True}
+    time.sleep(0.2)
+    assert len(runner.calls) == calls

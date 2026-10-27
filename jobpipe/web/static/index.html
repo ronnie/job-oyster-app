@@ -275,10 +275,11 @@
     <!-- Interview prep -->
     <section id="tab-prep" class="tab-panel">
       <div class="doc">
+        <div id="prep-pages" class="prep-pages" role="tablist" aria-label="Interview prep pages"></div>
         <div class="doc-head">
           <div class="doc-title">
             <h1>Interview prep</h1>
-            <p class="muted">Stories to find, examples to dig up, questions to get ready for. Changes save as you type. Ask Claude to add something and it shows up here (<code id="prep-path"></code>).</p>
+            <p class="muted">One page of notes, and one page for each company. Marking a role Interviewing builds its pack from the posting, the gaps and the résumé you sent: likely questions, stories cited from your impact record, questions to ask them, and a debrief. Lines you confirm from the debrief go into your impact record. Changes save as you type (<code id="prep-path"></code>).</p>
           </div>
           <span id="prep-state" class="save-state" role="status"></span>
           <div class="seg" id="prep-view" role="group" aria-label="View">
@@ -288,6 +289,7 @@
           </div>
           <button id="prep-save" class="primary" title="Save now (⌘S)">Save</button>
         </div>
+        <div id="prep-debrief" class="prep-debrief hidden"></div>
         <div id="prep-conflict" class="doc-conflict hidden" role="alert">
           <span class="grow">Your interview prep was changed outside this window (by Claude or another editor) since you opened it, so your latest edits haven't been saved.</span>
           <button data-act="load" class="ghost small">Discard mine, load that version</button>

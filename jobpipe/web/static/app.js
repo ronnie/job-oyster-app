@@ -169,7 +169,8 @@ function showTab(name) {
   if (name === "startups") loadStartups();
   if (name === "runs") loadRuns();
   if (name === "dashboard") renderDashboard();
-  if (name in DOCS) DOCS[name].load();
+  if (name === "prep") loadPrepPages();
+  else if (name in DOCS) DOCS[name].load();
   // Profile's cards load at once; the promise settles when all have (the About button scrolls down after that)
   if (name === "profile") return Promise.allSettled([loadProfile(), loadAI(), loadFormats(), loadGhostDays(), loadAbout()]);
 }
@@ -226,6 +227,8 @@ function openActionsHelp() {
       row("Full score", "1–10", "The same question, answered requirement by requirement. It replaces the signal score once a job has one."),
       row("Résumé", "1–10", "How well the résumé you made covers the posting. Every edit is rated again."),
       row("ATS", "%", "How much of the posting's skills, experience and keywords an applicant tracking system would find in the résumé.")),
+    h("h3", {}, "Interview prep"),
+    h("p", {}, "Marking a role Interviewing builds a pack on that company's page: likely questions, stories cited from your impact record, questions to ask them, and a debrief. Lines you confirm from the debrief go into your impact record. The notes page is for anything that isn't about one company."),
     h("h3", {}, "Logs"),
     h("p", {}, "The Logs tab lists searches and Make résumé, with each one's log. A signal or full score shows on the job instead. Runs carry on when the app restarts (oyster restart); quitting the app stops them, and it asks first."),
     h("div", { class: "actions" }, h("button", { class: "primary", onclick: () => dlg.close() }, "Close")));
@@ -1729,7 +1732,8 @@ async function setStatus(j, status) {
     // Applied, Done and Denied get the look's moment (confetti, the cat); the other statuses a plain toast.
     const shown = window.Look?.status({ job: j, status, prev, counts: stageCounts() });
     const notion = S.notionError ? "Notion will get it when it's back." : "";
-    if (!shown) toast(`Status set to ${status}.${notion ? " " + notion : ""}`);
+    const prep = status === "Interviewing" ? " Its pack is on Interview prep." : "";
+    if (!shown) toast(`Status set to ${status}.${prep}${notion ? " " + notion : ""}`);
     else if (notion) toast(notion);
     loadJobs({ wait: true });         // once the background sync has run, show whether Notion has it
   } catch (e) { j.status = prev; repaint(j); toast(e.message, true); }
@@ -2024,6 +2028,7 @@ function detailHead(j) {
     fitTile(j),
     h("h2", { title: [j.title, j.company].filter(Boolean).join(" · ") }, j.title || "(untitled)", j.company && h("span", { class: "sub" }, " · ", j.company)),
     statusControl(j),
+    prepButton(j),
     j.tailored ? h("span", { class: "score" }, "Résumé ", h("b", {}, j.resume_score ?? "–"), "/10 · ATS ", h("b", {}, pct(j.ats_total)))
       : j.impact_score != null && h("span", { class: "score" }, "Full score ", h("b", {}, j.impact_score), "/10"),
     refToggle(j),
@@ -2054,6 +2059,7 @@ function detailHead(j) {
     noPosting(j) && postingNeeded(j),
     h("div", { class: "bar" },
       statusControl(j),
+      prepButton(j),
       refToggle(j),
       extLink(j.url, "Posting"),
       extLink(j.notion_url, "Notion"),
@@ -4998,7 +5004,7 @@ function headings(text) {
 function docEditor({ key, url, onSaved = () => {} }) {
   const el = (part) => $(`#${key}-${part}`);
   const text = el("text"), preview = el("preview");
-  const D = { loaded: false, version: null, saved: "", updated: null, saving: null, saves: 0, timer: null, failed: "",
+  const D = { url, loaded: false, version: null, saved: "", updated: null, saving: null, saves: 0, timer: null, failed: "",
               conflict: null, previewed: null, previewTimer: null, mirror: null, editor: null, opening: null };
   const dirty = () => D.loaded && text.value !== D.saved;
   const view = () => S.docViews[key];
@@ -5007,7 +5013,7 @@ function docEditor({ key, url, onSaved = () => {} }) {
     if (D.saving) return;
     const saves = D.saves;
     let d;
-    try { d = await api(url); }
+    try { d = await api(D.url); }
     catch (e) { if (!D.loaded) setState(`Couldn't open it: ${e.message}`, "bad"); return; }
     if (D.saving || D.saves !== saves) return;    // a save started meanwhile: this reply may be older than it
     // Unsaved edits stay put; if the file moved on underneath them, the next save reports the conflict.
@@ -5039,7 +5045,7 @@ function docEditor({ key, url, onSaved = () => {} }) {
     setState("Saving…");
     D.saving = (async () => {
       try {
-        const res = await request(url, { method: "PUT", body: JSON.stringify({ markdown: md, version: D.version, force }) });
+        const res = await request(D.url, { method: "PUT", body: JSON.stringify({ markdown: md, version: D.version, force }) });
         const d = await res.json();
         if (res.status === 409) {
           D.conflict = d.current;
@@ -5114,7 +5120,7 @@ function docEditor({ key, url, onSaved = () => {} }) {
     if (view() !== "split" || D.previewed === text.value) return;
     const md = text.value;
     try {
-      const { html } = await post(`${url}/preview`, { markdown: md });
+      const { html } = await post(`${D.url}/preview`, { markdown: md });
       if (text.value !== md) return;      // a newer render is on its way
       preview.innerHTML = html;
       D.previewed = md;
@@ -5179,7 +5185,7 @@ function docEditor({ key, url, onSaved = () => {} }) {
     await save();
     if (D.conflict) throw new Error("Sort out the changed-elsewhere banner first.");
     if (D.failed) throw new Error(`Couldn't save your edits first: ${D.failed}`);
-    const res = await request(`${url}${path}`, { method: "POST", body: JSON.stringify({ ...body, version: D.version }) });
+    const res = await request(`${D.url}${path}`, { method: "POST", body: JSON.stringify({ ...body, version: D.version }) });
     const d = await res.json();
     if (res.status === 409) {
       D.conflict = d.current;
@@ -5194,7 +5200,27 @@ function docEditor({ key, url, onSaved = () => {} }) {
     return d;
   }
 
-  return { load, save, setView, amend, dirty: () => { sync(); return dirty(); },
+  // Interview prep keeps one editor and points it at the notes page or a company's page.
+  async function retarget(next) {
+    if (next === D.url && D.loaded) return true;
+    await save();
+    if (dirty() || D.conflict) return false;
+    D.url = next;
+    D.loaded = false;
+    D.version = null;
+    D.saved = "";
+    D.updated = null;
+    D.conflict = null;
+    D.failed = "";
+    D.previewed = null;
+    text.value = "";
+    if (D.editor) { D.editor.setMarkdown(""); D.editor.rebase(""); }
+    el("conflict").classList.add("hidden");
+    await load();
+    return D.loaded;
+  }
+
+  return { load, save, setView, amend, retarget, dirty: () => { sync(); return dirty(); },
            toggleView: () => setView(view() === "formatted" ? "edit" : "formatted") };
 }
 
@@ -5204,6 +5230,140 @@ const DOCS = {
   prep: docEditor({ key: "prep", url: "/api/interview-prep",
                     onSaved: (d) => { Object.assign($("#prep-path"), { textContent: d.path.split("/").slice(-2).join("/"), title: d.path }); } }),
 };
+
+// One notes page, and one page per company. A role marked Interviewing gets a pack on its company's page.
+const PREP = { pages: [], slug: "", opened: false, want: "", drafting: false, debriefSig: "" };
+
+async function openPrep(company, trackerId) {
+  PREP.want = company || "";
+  if (trackerId) {
+    try { await post("/api/interview-prep/ensure", { tracker_id: trackerId }); }
+    catch (e) { /* the page still opens; Build again is there if it couldn't start */ }
+  }
+  if (S.tab !== "prep") showTab("prep");
+  else loadPrepPages();
+}
+function prepButton(j) {
+  const reached = j.status === "Interviewing" || j.status === "Offer" || j.reached === "Interviewing" || j.reached === "Offer"
+    || (j.status === "Ghosted" && j.ghosted_from === "Interviewing");
+  if (!reached || !j.company) return null;
+  return h("button", { class: "ghost small", title: "Likely questions, stories and a debrief for this company",
+    onclick: () => openPrep(j.company, j.tracker_id) }, "Interview prep");
+}
+async function loadPrepPages() {
+  const want = PREP.want;
+  PREP.want = "";
+  let d;
+  try { d = await api("/api/interview-prep/pages"); }
+  catch (e) { if (!PREP.opened) toast(e.message, true); return; }
+  PREP.pages = d.pages;
+  renderPrepPages();
+  if (want) {
+    const page = PREP.pages.find((p) => p.slug === want || p.company.toLowerCase() === String(want).toLowerCase());
+    if (page) return openPrepPage(page.slug);
+  }
+  if (!PREP.opened) { PREP.opened = true; return openPrepPage(PREP.slug || ""); }
+  renderPrepDebrief();
+}
+async function openPrepPage(slug) {
+  const url = slug ? `/api/interview-prep/companies/${encodeURIComponent(slug)}` : "/api/interview-prep";
+  const ok = await DOCS.prep.retarget(url);
+  if (ok === false) { toast("Save this page first.", true); renderPrepPages(); return; }
+  PREP.slug = slug;
+  PREP.drafting = false;
+  renderPrepPages();
+  renderPrepDebrief();
+}
+function renderPrepPages() {
+  const bar = $("#prep-pages");
+  if (!bar) return;
+  bar.replaceChildren(...PREP.pages.map((p) => {
+    const writing = (p.roles || []).some((r) => r.state === "building");
+    const failed = (p.roles || []).some((r) => r.state === "error");
+    return h("button", { type: "button", role: "tab", class: p.slug === PREP.slug ? "on" : "",
+      "aria-selected": p.slug === PREP.slug ? "true" : "false", title: p.company,
+      onclick: () => openPrepPage(p.slug) },
+      p.company, writing ? h("small", {}, " …") : failed ? h("small", {}, " !") : null);
+  }));
+}
+function renderPrepDebrief() {
+  const box = $("#prep-debrief");
+  if (!box) return;
+  const page = PREP.pages.find((p) => p.slug === PREP.slug);
+  if (!page || page.kind !== "company") { box.classList.add("hidden"); box.replaceChildren(); PREP.debriefSig = ""; return; }
+  if (PREP.drafting) return;
+  const sig = JSON.stringify(page.roles || []);
+  if (sig === PREP.debriefSig) return;
+  PREP.debriefSig = sig;
+  box.classList.remove("hidden");
+  box.replaceChildren(...(page.roles || []).map((r) => {
+    const writing = r.state === "building";
+    const again = h("button", { type: "button", class: "ghost small", disabled: writing,
+      title: "Replaces this role's pack. Notes and other roles on the page stay.",
+      onclick: () => rebuildPrep(page.slug, r) }, writing ? "Writing the pack…" : "Build again");
+    const draft = h("button", { type: "button", class: "primary small", disabled: writing || r.state === "error",
+      title: "Lines from what you wrote under Debrief. You tick what goes into your impact record.",
+      onclick: () => draftDebrief(page, r, draft) }, "Draft lines from the debrief");
+    return h("div", { class: "prep-role" },
+      h("div", { class: "grow" },
+        h("b", {}, r.title || page.company),
+        h("p", { class: "muted" }, r.state === "error" ? (r.error || "The pack couldn't be written.")
+          : writing ? "Writing the pack from the posting, the gaps and the résumé you sent."
+          : (r.sources || "Likely questions, stories cited from your impact record, questions to ask them, and a debrief.")),
+        r.added ? h("p", { class: "muted" }, `${plural(r.added, "line")} added to your impact record.`) : null),
+      again, draft);
+  }));
+}
+async function rebuildPrep(slug, role) {
+  try {
+    await post(`/api/interview-prep/companies/${encodeURIComponent(slug)}/build`, { key: role.key });
+    PREP.debriefSig = "";
+    await loadPrepPages();
+  } catch (e) { toast(e.message, true); }
+}
+async function draftDebrief(page, role, btn) {
+  btn.disabled = true;
+  try {
+    await DOCS.prep.save();
+    const d = await post(`/api/interview-prep/companies/${encodeURIComponent(page.slug)}/debrief`, { key: role.key });
+    if (!d.lines.length) {
+      toast("Those notes didn't add anything your record doesn't already say.");
+      btn.disabled = false;
+      return;
+    }
+    PREP.drafting = true;
+    const rows = d.lines.map((l) => {
+      const cb = h("input", { type: "checkbox", checked: l.ok }), text = h("input", { type: "text", value: l.text, "aria-label": "Line" });
+      return { cb, text, el: h("li", { class: `sugg-line ${l.ok ? "new" : "detail"}` }, h("label", { class: "check" }, cb, text),
+        l.why ? h("small", {}, l.why) : null) };
+    });
+    const add = h("button", { type: "button", class: "primary" });
+    const count = () => { const n = rows.filter((r) => r.cb.checked).length; add.disabled = !n; add.textContent = `Add ${plural(n, "line")} to my impact record`; };
+    rows.forEach((r) => r.cb.addEventListener("change", count));
+    count();
+    add.addEventListener("click", async () => {
+      const lines = rows.filter((r) => r.cb.checked).map((r) => r.text.value.trim()).filter(Boolean);
+      add.disabled = true;
+      try {
+        await DOCS.impact.amend("/debrief-apply", { slug: page.slug, key: role.key, lines }, /^from your interviews$/i);
+        role.added = (role.added || 0) + lines.length;
+        PREP.drafting = false;
+        PREP.debriefSig = "";
+        toast(`Added ${plural(lines.length, "line")} to your impact record.`);
+        renderPrepDebrief();
+      } catch (e) { toast(e.message, true); count(); }
+    });
+    const box = $("#prep-debrief");
+    box.classList.remove("hidden");
+    box.replaceChildren(h("div", { class: "setup-draft" },
+      h("p", {}, h("b", {}, `Lines for your impact record, from the ${role.title} debrief. `),
+        h("span", { class: "muted" }, "Edit any of them; untick what's wrong. A figure that isn't in your notes is unticked until you check it.")),
+      h("ul", { class: "sugg-lines" }, ...rows.map((r) => r.el)),
+      h("div", { class: "actions" },
+        h("button", { type: "button", class: "ghost", onclick: () => { PREP.drafting = false; PREP.debriefSig = ""; renderPrepDebrief(); } }, "Cancel"),
+        h("span", { class: "grow" }), add)));
+  } catch (e) { toast(e.message, true); btn.disabled = false; }
+}
 // Confirmed facts: answers to a fit report's follow-up questions, added to the end of the impact record.
 const factBox = $("#fact-box"), factOpen = $("#fact-open");
 function showFactBox(open) {
@@ -5601,7 +5761,12 @@ async function setupInterview(role, pane, redraw) {
   setScope("tracker");
   api("/api/setup").then((d) => { WIZ.data = d; setupCard(); if (d.show) openSetup(0); }).catch(() => {});
   // An open document also picks up changes made elsewhere, e.g. notes Claude adds to interview prep.
-  setInterval(() => { if (!document.hidden) { loadSummary(); if (S.tab in DOCS) DOCS[S.tab].load(); } }, 5000);
+  setInterval(() => {
+    if (document.hidden) return;
+    loadSummary();
+    if (S.tab === "prep" && (PREP.pages || []).some((p) => (p.roles || []).some((r) => r.state === "building"))) loadPrepPages();
+    if (S.tab in DOCS) DOCS[S.tab].load();
+  }, 5000);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) { loadSummary(); loadJobs(); if (S.tab in DOCS) DOCS[S.tab].load(); }
   });

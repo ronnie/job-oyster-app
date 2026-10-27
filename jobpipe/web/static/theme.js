@@ -163,7 +163,7 @@ window.Look = (() => {
     return counts.out <= 1 ? `Sent to ${who(job)}. That's the first one out the door.` : `Sent to ${who(job)}. That's ${counts.out} out the door.`;
   }
   const doneWords = (job) => `Done: ${job.title || "this role"}${job.company ? ` at ${job.company}` : ""}.`;
-  const interviewingWords = (job) => `Interviewing at ${who(job)}. Go get them.`;
+  const interviewingWords = (job) => `Interviewing at ${who(job)}. Its pack is on Interview prep.`;
   const offerWords = (job) => `An offer from ${who(job)}!`;
   function deniedWords(job, counts) {
     return { lead: `${who(job)} passed.`,

@@ -1,5 +1,6 @@
 """The local tracker: source of truth on disk, Notion as a synced copy."""
 import json
+import sqlite3
 
 import httpx
 import pytest
@@ -91,6 +92,38 @@ def test_pull_brings_in_notion_changes_but_unsent_local_ones_win(tmp_path, monke
     fake.rows.clear()
     t.sync()
     assert [r["page_id"] for r in t.rows()] == ["p1"]
+
+
+def test_a_status_set_while_a_pull_is_writing_is_kept(tmp_path, monkeypatch):
+    """Interviewing's sync can still be writing when the status moves on to Denied. The pull already read a clean
+    row, so it must not put Interviewing back."""
+    t, fake, notion = make(tmp_path, [notion_row("p1", URL, status="Interviewing")])
+    t.sync()
+    assert next(r for r in t.rows() if r["page_id"] == "p1")["status"] == "Interviewing"
+    real_db = t._db
+    seen = {"n": 0}
+
+    def wrapped():
+        con = real_db()
+        def factory(cursor, row):
+            rec = sqlite3.Row(cursor, row)
+            cols = [d[0] for d in cursor.description or ()]
+            if "dirty_status" in cols and rec["id"] == "p1":
+                seen["n"] += 1
+                # The second read is the per-page one, after the snapshot of every row. Flip then, with that
+                # snapshot still in hand, the way a Denied request lands during the pull.
+                if seen["n"] == 2 and rec["dirty_status"] == 0 and rec["status"] == "Interviewing":
+                    t.set_status("p1", "Denied")
+            return rec
+        con.row_factory = factory
+        return con
+
+    monkeypatch.setattr(t, "_db", wrapped)
+    t.sync()
+    monkeypatch.undo()
+    assert next(r for r in t.rows() if r["page_id"] == "p1")["status"] == "Denied"
+    t.sync()
+    assert status_in_notion(fake, "p1") == "Denied"
 
 
 def test_seed_from_the_old_snapshot_and_working_without_notion(tmp_path):

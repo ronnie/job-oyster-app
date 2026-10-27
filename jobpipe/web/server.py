@@ -2298,6 +2298,34 @@ def create_app(cfg: Config, *, token: str, store: Optional[Store] = None,
         state["runner"] = None  # the cached system prompt includes the record
         return impact_payload(new)
 
+    @app.post("/api/jobs/{jid}/resume/from-fact")
+    async def resume_from_fact(jid: str, body: dict):
+        """One pass: rewrite only the lines a new confirmed fact unlocks, re-check honesty and the
+        keyword score, and leave a proposal. The fact is already on the impact record. Nothing is
+        saved until the proposal is accepted. This is not Make résumé."""
+        fact = re.sub(r"\s+", " ", str(body.get("fact") or body.get("text") or "")).strip()
+        if not fact:
+            raise HTTPException(400, "Write the fact this résumé should use.")
+        ws = workspace(jid)
+        lock = state["edit_locks"].setdefault(jid, asyncio.Lock())
+        if lock.locked():
+            raise HTTPException(409, "Claude is still answering your last message.")
+        async with lock:
+            state["chatting"].add(jid)
+            try:
+                r = await ws.patch_from_fact(fact, get_runner(), cfg, read_impact())
+                p = r["proposal"]
+                return {"reply": r["reply"], "reply_html": md_html(r["reply"]), "chat": chat_payload(ws),
+                        "proposal": p and {**p, "changes_html": md_html(p["changes"])}}
+            except HTTPException:
+                raise
+            except EditError as e:
+                raise HTTPException(400, str(e)) from None
+            except Exception as e:  # noqa: BLE001 - surface model failures to the UI
+                raise HTTPException(502, f"The AI couldn't update the résumé: {e}") from None
+            finally:
+                state["chatting"].discard(jid)
+
     # ---- what a résumé says that the impact record doesn't (record_import.py) ------------------------------
     # Checked in a process of its own: the evidence models take gigabytes, and this way they go when it ends.
     async def record_gaps(md: str) -> dict:

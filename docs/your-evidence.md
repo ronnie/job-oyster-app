@@ -36,6 +36,6 @@ Soft Skills: Skill | Skill | Skill
 
 Delete Jordan's `resume-platform.md` once yours are in.
 
-**Confirmed facts** (the impact record's `# Confirmed facts` section). Leave this out at first. It's added when you answer a fit report's follow-up questions with **Add a confirmed fact** in the **Impact record** tab: each answer goes at the end of the record, dated and marked user-confirmed. (A `references/user-notes.md` from an older version still counts; move its lines into the record whenever you like.)
+**Confirmed facts** (the impact record's `# Confirmed facts` section). Leave this out at first. It's added when you answer a fit report's follow-up questions with **Add a confirmed fact** in the **Impact record** tab, or on the fit report itself: each answer goes at the end of the record, dated and marked user-confirmed. **Update this résumé** on that report then uses the new fact without making the résumé again. (A `references/user-notes.md` from an older version still counts; move its lines into the record whenever you like.)
 
 **Interview prep** (`data/interview-prep.md`). Created the first time you open the app's **Interview prep** tab: a page for stories you need to find, examples and numbers to dig up, and questions to get ready for. Edit it formatted like the impact record; `- [ ] ` makes a checkbox you can tick. It's a plain markdown file, so you can also ask Claude to add to it, and the open tab shows the change. It isn't used for scoring or résumés.

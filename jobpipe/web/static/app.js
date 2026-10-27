@@ -2184,7 +2184,7 @@ function emptyTab(j, d, tab) {
   const what = {
     resume: ["No résumé made yet", `${ACTIONS.resume.what} It takes ${actionTime("resume")}; you can follow its log in Logs.`],
     report: ["No fit report yet",
-      "Make résumé writes the fit report: the scores, the ATS scorecard, the gaps, and at the end, the follow-up questions to answer. Add your answers as confirmed facts in the Impact record (under Profile), then make the résumé again."],
+      "Make résumé writes the fit report: the scores, the ATS scorecard, the gaps, and at the end, the follow-up questions to answer. Answer one there, then Update this résumé: one pass rewrites only the lines that fact unlocks. Making the résumé again is for the first version."],
     heatmap: ["No heat map yet",
       `The heat map rates every requirement in the posting against your impact record and each résumé. A full score makes one in ${actionTime("full")} without writing a résumé; Make résumé makes one too.`],
   }[tab];
@@ -2501,8 +2501,75 @@ async function renderReport(d, panel) {
   panel.append(box);
   try {
     const r = await api(`/api/jobs/${encodeURIComponent(d.id)}/report`);
-    box.replaceChildren(h("div", { class: "markdown", html: r.html }));
+    box.replaceChildren(h("div", { class: "markdown", html: r.html }), factUpdateCard(d));
   } catch (e) { box.replaceChildren(h("div", { class: "muted" }, e.message)); }
+}
+
+// Answer one follow-up question on this report, then update the résumé in one pass. The fact is saved
+// on the impact record first; Update this résumé rewrites only the lines it unlocks.
+function factUpdateCard(d) {
+  const j = S.byId.get(d.id);
+  const ta = h("textarea", { rows: 3, "aria-label": "Confirmed fact",
+    placeholder: "Answer one follow-up question, in your words. Only what you can stand behind." });
+  const add = h("button", { type: "button", class: "primary" }, "Add confirmed fact");
+  const status = h("div", { class: "fact-update-status" });
+  add.addEventListener("click", async () => {
+    const fact = ta.value.trim();
+    if (!fact) return ta.focus();
+    add.disabled = true;
+    try {
+      await DOCS.impact.amend("/facts", { text: fact });
+      ta.value = "";
+      if (!j?.tailored) {
+        toast("Added to Confirmed facts.");
+        status.replaceChildren(h("p", { class: "muted" }, "The fact is in your impact record. Make a résumé for this job when you want it used."));
+        return;
+      }
+      const go = h("button", { type: "button", class: "primary" }, "Update this résumé");
+      const later = h("button", { type: "button", class: "ghost" }, "Not now");
+      later.addEventListener("click", () => status.replaceChildren());
+      go.addEventListener("click", () => updateResumeFromFact(j, fact, go, status));
+      status.replaceChildren(
+        h("p", {}, "Saved. Update this résumé rewrites only the lines that fact unlocks, re-checks honesty and the keyword score, and shows a diff you accept. It does not run Make résumé again."),
+        h("div", { class: "actions" }, later, go));
+      status.scrollIntoView({ block: "center" });
+    } catch (err) { toast(err.message, true); }
+    finally { add.disabled = false; }
+  });
+  return h("div", { class: "card fact-update" },
+    h("h3", {}, "Answer a follow-up question"),
+    h("p", { class: "muted" }, "This saves a confirmed fact on your impact record. After that, one pass can update this résumé. You don't make it again."),
+    ta, h("div", { class: "actions" }, add), status);
+}
+
+// One model call. The résumé tab then shows the proposal: the diff, the honesty check, Accept or Discard.
+async function updateResumeFromFact(job, fact, button, status) {
+  const cached = S.details.get(job.id)?.d;
+  if (cached?.resume?.proposal && !confirm("A proposed edit is waiting. Updating from this fact replaces it.")) return;
+  const label = button.textContent;
+  button.disabled = true;
+  button.replaceChildren(spinner(), " Updating the lines this fact unlocks…");
+  try {
+    const res = await post(`/api/jobs/${encodeURIComponent(job.id)}/resume/from-fact`, { fact });
+    if (cached?.resume) cached.resume.proposal = !!res.proposal;
+    if (!res.proposal) {
+      button.disabled = false;
+      button.textContent = label;
+      const note = res.reply || "This fact doesn't change a line on this résumé.";
+      if (status) status.replaceChildren(h("p", {}, note));
+      else toast(note, false);
+      return;
+    }
+    toast("Review the diff, then accept or discard it.");
+    S.reviewProposal = job.id;
+    S.detailTab = "resume";
+    S.detailTabJob = job.id;
+    openJob(job.id, "resume");
+  } catch (e) {
+    toast(e.message, true);
+    button.disabled = false;
+    button.textContent = label;
+  }
 }
 
 // ---- résumé workspace ---------------------------------------------------------------------------
@@ -2743,7 +2810,13 @@ function renderResume(d, panel, sent = null) {
     try { chat.msgs = (await post(`/api/jobs/${id}/chat/clear`)).chat; paint(); }
     catch (e) { toast(e.message, true); }
   });
-  if (r.proposal) api(`/api/jobs/${id}/edit`).then((res) => { if (res.proposal) { pdf.single(); toCurrent(); renderProposal(d, res.proposal, proposalBox, frame, cur); } });
+  if (r.proposal) api(`/api/jobs/${id}/edit`).then((res) => {
+    if (!res.proposal) return;
+    pdf.single();
+    toCurrent();
+    renderProposal(d, res.proposal, proposalBox, frame, cur);
+    if (S.reviewProposal === d.id) { S.reviewProposal = null; proposalBox.scrollIntoView({ block: "start" }); }
+  });
   paint();
 }
 
@@ -2947,6 +3020,7 @@ function versionShort(v) {
   if (v.source?.startsWith("restored")) return `Restored ${v.source.slice(9)}`;
   if (v.source === "by hand") return /^Edited as text/.test(v.changes || "") ? "Edited as text" : "Edit on page";
   if (v.source === "upload") return "Uploaded";
+  if (v.source === "fact") return "From a fact";
   const t = v.instruction || v.changes || "";
   return t.length > 24 ? `${t.slice(0, 23).trimEnd()}…` : t;
 }
@@ -3225,12 +3299,16 @@ function renderProposal(d, p, box, frame, cur) {
     h("h3", {}, "Proposed edit (PDF on the left shows it)"),
     h("p", { class: "muted" }, `“${p.instruction}”`),
     h("div", { class: "metrics" },
-      p.ats != null && h("span", { title: p.rerated === false ? "Couldn't re-rate the requirements, so skills and experience are the last version's; keywords are measured on this PDF." : "Skills and experience re-rated for this edit, keywords measured on this PDF" },
+      p.ats != null && h("span", { title: p.source === "fact"
+        ? "Keywords measured on this résumé. Requirement ratings stay as they were; this pass doesn't re-score them."
+        : p.rerated === false ? "Couldn't re-rate the requirements, so skills and experience are the last version's; keywords are measured on this PDF."
+        : "Skills and experience re-rated for this edit, keywords measured on this PDF" },
         "ATS ", h("b", {}, pct(p.ats)), delta(p.ats, versionAts(j, cur), "%"), p.rerated === false ? " (keywords only)" : ""),
       p.resume_score != null && h("span", {}, "Résumé ", h("b", {}, p.resume_score), "/10", delta(p.resume_score, versionScore(j, cur))),
       h("span", {}, "Keywords ", h("b", {}, pct(p.keywords_pct)), delta(p.keywords_pct, cur?.keywords_pct, "%")),
       h("span", {}, "Format check ", checkBadge(p.check)),
       h("span", {}, "Pages ", h("b", { class: p.pages === 2 ? "" : "fail" }, p.pages))),
+    honestyNote(p.honesty),
     h("h3", {}, "Claude's note"),
     h("div", { class: "changes markdown", html: p.changes_html }),
     h("h3", {}, "Diff"),
@@ -3245,6 +3323,17 @@ function renderProposal(d, p, box, frame, cur) {
     try { await post(`/api/jobs/${id}/edit/discard`); toast("Edit discarded."); reloadResume(d.id); }
     catch (e) { toast(e.message, true); }
   });
+}
+
+function honestyNote(check) {
+  if (!check) return null;
+  if (check.passed) return h("p", { class: "honesty pass" },
+    `Honesty check passed (${plural(check.checked, "line")}). Every figure is in your evidence, including this fact.`);
+  const n = check.flagged?.length || 0;
+  return h("div", { class: "honesty fail" },
+    h("p", {}, `Honesty check flagged ${plural(n, "line")}. A figure there isn't in your evidence or this fact.`),
+    h("ul", {}, ...(check.flagged || []).map((f) => h("li", {},
+      f.line, f.figures?.length ? ` — ${f.figures.join(", ")}` : ""))));
 }
 
 function renderDiff(ops) {
@@ -3770,7 +3859,7 @@ function renderRunResults(r) {
   box.replaceChildren(
     h("h3", {}, `Results: ${plural(res.length, "job")}`),
     h("p", { class: "muted" }, tailored
-      ? "Open a job's Fit report: its follow-up questions are at the end. Add your answers as confirmed facts in the Impact record (under Profile), then make the résumé again if they change what it can claim."
+      ? "Open a job's Fit report: its follow-up questions are at the end. Answer one there, then Update this résumé. That rewrites only the lines the new fact unlocks. You don't make the résumé again."
       : "Open a job to see its score, matches and likely gaps beside the posting."),
     h("ul", {}, ...res.map((x) => h("li", {},
       h("span", { class: `fit ${fitClass(x.impact_score ?? x.fit)}` }, x.impact_score ?? x.fit ?? "–"),
@@ -5209,7 +5298,12 @@ const factBox = $("#fact-box"), factOpen = $("#fact-open");
 function showFactBox(open) {
   factBox.classList.toggle("hidden", !open);
   factOpen.setAttribute("aria-expanded", String(open));
-  if (open) $("#fact-text").focus();
+  if (open) {
+    const offer = $("#fact-offer");
+    offer.classList.add("hidden");
+    offer.replaceChildren();
+    $("#fact-text").focus();
+  }
 }
 factOpen.addEventListener("click", () => showFactBox(factBox.classList.contains("hidden")));
 $("#fact-cancel").addEventListener("click", () => showFactBox(false));
@@ -5219,10 +5313,26 @@ factBox.addEventListener("submit", async (e) => {
   if (!t.value.trim()) return t.focus();
   btn.disabled = true;
   try {
-    await DOCS.impact.amend("/facts", { text: t.value });
+    const fact = t.value.trim();
+    await DOCS.impact.amend("/facts", { text: fact });
     t.value = "";
-    showFactBox(false);
-    toast("Added to Confirmed facts at the end of the record.");
+    const job = S.byId.get(S.selected);
+    const offer = $("#fact-offer");
+    if (job?.tailored) {
+      const go = h("button", { type: "button", class: "primary" }, `Update the résumé for ${job.company || job.title || "this job"}`);
+      const later = h("button", { type: "button", class: "ghost" }, "Not now");
+      later.addEventListener("click", () => { offer.classList.add("hidden"); offer.replaceChildren(); showFactBox(false); });
+      go.addEventListener("click", () => updateResumeFromFact(job, fact, go));
+      offer.replaceChildren(
+        h("p", {}, "Saved under Confirmed facts. Update this résumé rewrites only the lines that fact unlocks, then shows a diff you accept."),
+        h("div", { class: "actions" }, later, go));
+      offer.classList.remove("hidden");
+      toast("Added to Confirmed facts.");
+    } else {
+      offer.classList.add("hidden");
+      showFactBox(false);
+      toast("Added to Confirmed facts. On that job's Fit report, Update this résumé applies it without making the résumé again.");
+    }
   } catch (err) { toast(err.message, true); }
   finally { btn.disabled = false; }
 });

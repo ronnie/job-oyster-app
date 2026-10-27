@@ -13,6 +13,10 @@ Claude edits the markdown, never the PDF. Every proposal is re-rendered, run thr
 check_resume.py and scored before the candidate sees it, and nothing replaces the current version
 until they accept it.
 
+A confirmed fact can update the same résumé in one pass (patch_from_fact): only the lines that
+fact unlocks change, honesty and the keyword score are checked again, and the result is a proposal
+like any other edit. The three-draft pipeline is how the first version is made.
+
 The candidate can also edit by hand: on the page (the résumé drawn in the PDF's layout, each line
 click-to-edit; apply_page_edits maps the changed text back onto its markdown lines) or as the
 markdown itself. A hand edit is saved straight away as a new version, re-rendered and checked.
@@ -39,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .. import config, formats, render
+from .. import config, evidence, formats, render
 from ..config import Config, ModelCfg
 from ..llm import AgentCall, Runner, brief
 from ..tailor import VALUE, exact_title, normalize_keywords, run_script, scorecard
@@ -73,6 +77,22 @@ RERATE_BRIEF = """# Re-rate the edited resume
 requirements.json lists every skills and experience row with its weight and the rating the previous version got, plus that version's 1-10 score. For each row, rate the revised resume literally on what it says: a resume only gets credit for what is on the page, because recruiters don't infer. strong = clearly demonstrated with scope or results; partial = adjacent or transferable; missing = not on the page. Keep the previous rating wherever the change (changes.md) doesn't touch what the page shows for that row, so a score moves only because the resume did. Then score the revised resume 1-10 with the rubric in scoring-and-report.md.
 
 Write `ratings.json`: {{"skills": ["strong"|"partial"|"missing", ...], "experience": [...], "score": n}}, one rating per row, in the order of requirements.json.
+"""
+
+FACT_PATCH_BRIEF = """# Update the résumé from one confirmed fact
+
+{name} just confirmed one fact. It is already saved under Confirmed facts. Update the current résumé so it can say what that fact says. This is not a new résumé: do not remake it, restyle it, or revisit lines the fact does not change.
+
+Write `reply.md`: which lines you changed, in his words for the fact, and where the fact supports each. If the fact unlocks nothing on this page, say so and do not write `resume-edited.md`.
+
+Write `resume-edited.md` only when a line should change: the complete résumé, identical to the current one except for those lines.
+
+Rules:
+1. Change only a line the new fact unlocks: a summary sentence, a bullet, or a skills phrase that can now state what the fact states. Use the fact's own words for anything you add — its verbs, its figures, its scope. "Contributed to" stays "contributed to" unless the fact itself says otherwise.
+2. Leave every other line exactly as it is, including headings, the headline, job lines, dates, and bullets the fact does not speak to. Do not tighten, reorder, merge, or delete.
+3. Add no claim, figure, tool, title, or scope the fact does not state. Follow the Do-not-claim list. A pinned section, if the résumé has one, stays word for word.
+4. Keep the exact markdown shape of the writer brief (headings, job lines, italic date lines, CORE SKILLS, plain characters only).
+5. Keep to the length limit at the end of this brief. If adding the fact would break it, add it to the one existing line it belongs on instead of a new bullet, or change nothing and say so.
 """
 
 
@@ -417,6 +437,77 @@ class ResumeWorkspace:
         self._say("claude", reply, proposal=True, **tag)
         return {"reply": reply, "proposal": {**proposal, "diff": diff(current, new_md)}}
 
+    async def patch_from_fact(self, fact: str, runner: Runner, cfg: Config, impact_md: str) -> dict:
+        """One pass over the current résumé for a fact the candidate just confirmed.
+
+        Rewrites only lines that fact unlocks, then re-checks honesty (figures against the record,
+        including this fact) and the keyword score. The result is a proposal until they accept it.
+        Requirement rows are not re-rated: that would be a second model call, and this pass is one.
+        """
+        if not self.editable():
+            raise EditError("This résumé was saved without its posting and match brief, so it can't be updated "
+                            "from a fact here. Tailor the job in the app to get an editable copy.")
+        fact = re.sub(r"\s+", " ", fact).strip()
+        if not fact:
+            raise EditError("Write the fact this résumé should use.")
+        h = await asyncio.to_thread(self.history)
+        current = self.md(h["current"])
+        cand = config.candidate()
+        target = self.format
+        call = AgentCall(label="resume-fact", model=cfg.writer_model,
+                         instructions=cand.personalize(FACT_PATCH_BRIEF) + "\n" + formats.length_rules(target),
+                         documents={"jd.md": (self.run_dir / "jd.md").read_text(),
+                                    "04-match.md": (self.run_dir / "04-match.md").read_text(),
+                                    "resume-current.md": current,
+                                    "confirmed-fact.md": fact,
+                                    "writer brief (for the resume shape)": brief("05-resume-writer.md")},
+                         expect=["reply.md"], prose_file="reply.md",
+                         tail="The new confirmed fact, and the only thing this pass may add:\n" + fact)
+        res = await runner.run(call)
+        reply = res.files.get("reply.md", "").strip()
+        raw = res.files.get("resume-edited.md", "")
+        kept = apply_fact_edits(current, raw, fact) if raw.strip() else current
+        if kept.strip() == current.strip():
+            if raw.strip() and any(o["op"] != "same" for o in diff(current, raw)):
+                reply = (reply + "\n\n" if reply else "") + (
+                    "Nothing was kept. This pass only changes a line when the new fact's own words are what it adds.")
+            reply = reply or "This fact doesn't change a line on this résumé."
+            self._say("note", "A confirmed fact didn't change this résumé.")
+            self._say("claude", reply)
+            return {"reply": reply, "proposal": None}
+        dropped = sum(1 for o in diff(kept, raw) if o["op"] != "same") if raw.strip() else 0
+        if dropped:
+            reply = (reply + "\n\n" if reply else "") + (
+                "Other lines the fact doesn't unlock were left as they are.")
+        kept = kept if kept.endswith("\n") else kept + "\n"
+        prop_md = self.vdir / "proposal.md"
+        prop_md.write_text(kept)
+        prior = self.prior(h)
+        pages, pdf_text = await asyncio.to_thread(
+            render.render_pdf, kept, self.vdir / "proposal.pdf", None, target, self.pdf_title)
+        check = await asyncio.to_thread(self.check, prop_md, target)
+        honesty = await asyncio.to_thread(self.honesty, kept, impact_md, fact)
+        scores = self.scores(prior["ratings"], prior["score"], pdf_text or kept, rerated=False) if prior else {}
+        instruction = "Update from a confirmed fact: " + fact
+        proposal = {"created": _now(), "instruction": instruction, "changes": reply, "source": "fact",
+                    "pages": pages, "check": check, "honesty": honesty, "format": target.id,
+                    "keywords_pct": self.keyword_pct(kept), "base": h["current"], **scores}
+        h["proposal"] = proposal
+        self._save(h)
+        self._say("note", "Updated from a confirmed fact.")
+        self._say("claude", reply, proposal=True)
+        return {"reply": reply, "proposal": {**proposal, "diff": diff(current, kept)}}
+
+    def honesty(self, md: str, impact_md: str, fact: str) -> dict:
+        """Figure check of every claim line. The new fact counts as evidence, as does the impact record."""
+        trace = self.run_dir / "trace-final.md"
+        match = (self.run_dir / "04-match.md").read_text() if (self.run_dir / "04-match.md").exists() else ""
+        passages = passages_for(impact_md, fact)
+        checks = evidence.check_lines(md, trace.read_text() if trace.exists() else "", match, passages)
+        flagged = [c for c in checks if c.flagged]
+        return {"passed": not flagged, "checked": len(checks),
+                "flagged": [{"section": c.section, "line": c.line, "figures": c.missing_figures} for c in flagged]}
+
     def accept(self) -> dict:
         h = self.history()
         p = h.get("proposal")
@@ -428,9 +519,12 @@ class ResumeWorkspace:
         (self.vdir / "proposal.md").rename(self.vdir / f"v{n}.md")
         (self.vdir / "proposal.pdf").rename(self.vdir / f"v{n}.pdf")
         fid = p.get("format") or h.get("format") or self._drawn_in()
-        h["versions"].append({"n": n, "created": _now(), "source": "edit", "instruction": p["instruction"],
-                              "changes": p["changes"], "keywords_pct": p["keywords_pct"], "check": p["check"],
-                              "format": fid, **{k: p[k] for k in SCORE_KEYS if k in p}})
+        saved = {"n": n, "created": _now(), "source": p.get("source") or "edit", "instruction": p["instruction"],
+                 "changes": p["changes"], "keywords_pct": p["keywords_pct"], "check": p["check"],
+                 "format": fid, **{k: p[k] for k in SCORE_KEYS if k in p}}
+        if p.get("honesty"):
+            saved["honesty"] = p["honesty"]
+        h["versions"].append(saved)
         h["current"], h["proposal"], h["format"] = n, None, fid
         self._save(h)
         self._export(n)
@@ -690,6 +784,119 @@ def apply_page_edits(md: str, edits: list[dict]) -> tuple[str, int]:
             continue
         lines[n] = lines[n][:m.start(2)] + _patch(m.group(2), old, new) + lines[n][m.end(2):]
     return "\n".join(l for k, l in enumerate(lines) if k not in gone), changed
+
+
+# Words too common to count as the fact "unlocking" a line. A kept change has to add a content
+# word, a figure, or a name that the fact itself uses.
+_FACT_STOP = frozenset("""
+a an the and or but for with from that this these those was were been have has had not no nor
+did does doing done don't doesnt didn't dont into over under about your you his her their them
+they she him its are of to in on at by as it is be we our my me i also than then just only each
+per via across after before while when where which who what how all any some more most other such
+both same one two out up off so if can will would should could may might must very really
+including include across within without between among during through
+""".split())
+
+
+def content_words(text: str) -> set[str]:
+    """Numbers and words a fact can unlock a line with. Stopwords and one-letter tokens are out."""
+    words: set[str] = set()
+    for n in re.findall(r"\d[\d,]*(?:\.\d+)?", text):
+        words.add(n.replace(",", ""))
+    for raw in re.findall(r"[A-Za-z][A-Za-z0-9'+/#.-]*", text):
+        w = raw.lower().strip("'")
+        if w.endswith("'s"):
+            w = w[:-2]
+        w = w.strip(".-")
+        if len(w) >= 3 and w not in _FACT_STOP:
+            words.add(w)
+            if "-" in w:                          # "payments-vendor" also counts as its parts
+                words.update(p for p in w.split("-") if len(p) >= 3 and p not in _FACT_STOP)
+    return words
+
+
+def _locked_shape(line: str) -> bool:
+    """Name, headings, the headline, a job line and a date line. A fact doesn't rewrite the skeleton.
+    A blank line is not one of those: an inserted bullet has no old line to lock."""
+    s = line.strip()
+    if not s:
+        return False
+    if s.startswith("#"):
+        return True
+    if re.match(r"^\*[^*].*\*$", s):             # *Mar 2023–Sep 2026 | Remote*
+        return True
+    if re.match(r"^\*\*.+\*\*$", s):             # the headline: the whole line is bold
+        return True
+    if re.match(r"^\*\*[^*]+\*\*\s*\|", s):      # **Company** | Title
+        return True
+    return False
+
+
+def _unlocked(old: str, new: str, fact_words: set[str]) -> bool:
+    """A replacement or a new line stays only when it adds the fact's own words."""
+    if not fact_words or old.strip() == new.strip():
+        return False
+    if not new.strip() or _locked_shape(old) or _locked_shape(new):
+        return False
+    return bool((content_words(new) - content_words(old)) & fact_words)
+
+
+def _rewrite_block(olds: list[str], news: list[str], fact_words: set[str]) -> list[str]:
+    """Pair a changed block. Rewrites stay when the fact unlocks them; deletions don't; inserts do
+    when they carry the fact's words."""
+    if len(olds) == len(news):
+        return [n if _unlocked(o, n, fact_words) else o for o, n in zip(olds, news)]
+    used: set[int] = set()
+    rewrites: dict[int, str] = {}
+    inserts: list[str] = []
+    for nline in news:
+        best_i, best_r = None, 0.45
+        for i, o in enumerate(olds):
+            if i in used:
+                continue
+            r = difflib.SequenceMatcher(None, o, nline, autojunk=False).ratio()
+            if r > best_r:
+                best_i, best_r = i, r
+        if best_i is None:
+            if _unlocked("", nline, fact_words):
+                inserts.append(nline)
+            continue
+        used.add(best_i)
+        rewrites[best_i] = nline if _unlocked(olds[best_i], nline, fact_words) else olds[best_i]
+    return [rewrites.get(i, o) for i, o in enumerate(olds)] + inserts
+
+
+def apply_fact_edits(old: str, new: str, fact: str) -> str:
+    """The current résumé with only the lines `fact` unlocks taken from `new`.
+
+    A model asked to rewrite a few lines still returns the whole résumé, and sometimes rewrites
+    lines the fact doesn't speak to. Those lines stay as they were. Headings, the headline, job
+    lines and dates stay too.
+    """
+    fact_words = content_words(fact)
+    old_lines, new_lines = old.splitlines(), new.splitlines()
+    out: list[str] = []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False).get_opcodes():
+        if tag == "equal" or tag == "delete":
+            out.extend(old_lines[i1:i2])          # a fact unlocks lines; it doesn't delete them
+        elif tag == "insert":
+            out.extend(l for l in new_lines[j1:j2] if _unlocked("", l, fact_words))
+        else:
+            out.extend(_rewrite_block(old_lines[i1:i2], new_lines[j1:j2], fact_words))
+    text = "\n".join(out)
+    return text + ("\n" if old.endswith("\n") or text else "")
+
+
+def passages_for(impact_md: str, fact: str) -> list[evidence.Passage]:
+    """The candidate's evidence, with the impact record the app has open and this fact counted."""
+    try:
+        mats = dict(evidence.materials())
+    except OSError:
+        mats = {}
+    mats[config.IMPACT_SOURCE] = impact_md
+    passages = [p for name, text in mats.items() for p in evidence.split_markdown(name, text)]
+    passages.append(evidence.Passage("Impact record › Confirmed facts", fact))
+    return passages
 
 
 def diff(old: str, new: str) -> list[dict]:

@@ -114,7 +114,7 @@ Start small, and check each step before spending more credits or Claude usage. F
 .venv/bin/python -m jobpipe tailor <job id>       # Make résumé for one job
 ```
 
-Everything here can also be done from the app: run searches in **Filters**, score jobs in **Search Jobs**, and watch progress in **Logs**. Read the first fit report closely. Weak scores or thin résumés usually mean the impact record is missing something; add it, or answer the report's questions with **Add a confirmed fact**, and make the résumé again.
+Everything here can also be done from the app: run searches in **Filters**, score jobs in **Search Jobs**, and watch progress in **Logs**. Read the first fit report closely. Weak scores or thin résumés usually mean the impact record is missing something; add it, or answer the report's questions with **Add a confirmed fact**, then **Update this résumé**. That one pass rewrites only the lines the fact unlocks. Making the résumé again is for a first version.
 
 ## 9. Run the tests
 

@@ -254,9 +254,10 @@
         </div>
         <form id="fact-box" class="fact-box hidden">
           <label for="fact-text">Confirmed fact</label>
-          <p class="muted">An answer to a fit report's follow-up question, in your words. It goes at the end of the record under <b>Confirmed facts</b>, dated, and every score and résumé edit uses it at exactly the scope you write. Tailor a job again for its résumé to pick it up.</p>
+          <p class="muted">An answer to a fit report's follow-up question, in your words. It goes at the end of the record under <b>Confirmed facts</b>, dated, and every score and résumé edit uses it at exactly the scope you write. If a job with a résumé is open, you can update that résumé from here. Otherwise open its Fit report and choose <b>Update this résumé</b>. You don't make the résumé again.</p>
           <textarea id="fact-text" rows="2" placeholder="e.g. I ran the vendor migration at Northwind, but I didn't manage the vendor's team."></textarea>
           <div class="actions"><button type="submit" class="primary">Add fact</button><button type="button" id="fact-cancel" class="ghost">Cancel</button></div>
+          <div id="fact-offer" class="fact-offer hidden"></div>
         </form>
         <div id="impact-conflict" class="doc-conflict hidden" role="alert">
           <span class="grow">The impact record was changed outside this window since you opened it, so your latest edits haven't been saved.</span>

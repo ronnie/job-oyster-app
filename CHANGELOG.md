@@ -2,6 +2,11 @@
 
 What changed in the app, newest first. Each release's notes on GitHub list what it added.
 
+## 2026-10-27
+
+### Résumés
+- Update a résumé from a new confirmed fact in one pass, without making it again
+
 ## 2026-10-26
 
 ### Finding jobs

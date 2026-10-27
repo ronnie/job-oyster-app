@@ -1494,6 +1494,119 @@ def test_confirmed_facts(env):
     assert r.status_code == 409 and r.json()["current"]["version"] == d["version"]
 
 
+def test_apply_fact_edits_keeps_only_lines_the_fact_unlocks():
+    from jobpipe.web.resumes import apply_fact_edits
+    old = ("# Jordan Rivera\n**Staff TPM | 9+ Years**\nPortland, OR\n\n## PROFESSIONAL EXPERIENCE\n\n"
+           "**Northwind Cloud** | Senior TPM\n*Mar 2023–Sep 2026 | Remote*\n\n"
+           "- Kept this payments line.\n- Wrote the playbook for other program managers.\n")
+    fact = "I ran the vendor migration at Northwind."
+    new = old.replace("- Kept this payments line.\n",
+                      "- Kept this payments line.\n- Ran the vendor migration at Northwind.\n")
+    new = new.replace("## PROFESSIONAL EXPERIENCE", "## WORK").replace(
+        "**Staff TPM | 9+ Years**", "**Chief TPM | 9+ Years**").replace(
+        "- Wrote the playbook for other program managers.", "- Invented a company-wide operating system.")
+    out = apply_fact_edits(old, new, fact)
+    assert "- Ran the vendor migration at Northwind." in out
+    assert "## PROFESSIONAL EXPERIENCE" in out and "## WORK" not in out
+    assert "**Staff TPM | 9+ Years**" in out and "Chief TPM" not in out
+    assert "Wrote the playbook" in out and "operating system" not in out
+    assert apply_fact_edits(old, old.replace("playbook", "handbook"), fact) == old
+
+
+def _fact_runner(env, resume):
+    """The résumé chat's runner, answering only the one fact-update call."""
+    runner = env["runner"]
+    pipeline = runner.run
+
+    async def run(call):
+        if call.label != "resume-fact":
+            return await pipeline(call)
+        runner.calls.append(call)
+        return AgentResult(files={"resume-edited.md": resume, "reply.md": "Added the vendor migration to the renewal bullet."},
+                           summary="")
+    runner.run = run
+    return runner
+
+
+def test_resume_updates_from_a_confirmed_fact(env):
+    """One call rewrites only the lines the fact unlocks, re-checks honesty and keywords, and waits for accept."""
+    c, run_dir, runner = env["client"], env["run_dir"], env["runner"]
+    (run_dir / "keywords.json").write_text(json.dumps(
+        {"TPM": "technical program manag", "reliability": "reliab", "keelhaul": "keelhaul"}))
+    _ratings(run_dir)
+    fact = "I ran the keelhaul program, the vendor migration at Northwind."
+    base = _resume()
+    edited = base.replace(
+        "comparing three vendors on fees, uptime history and migration cost.",
+        "comparing three vendors on fees, uptime history and migration cost, and ran the keelhaul program, "
+        "the vendor migration at Northwind.").replace(
+        "Wrote the platform's program management playbook (intake, prioritization, status, launch reviews), "
+        "now used by four other program managers.",
+        "Invented a company-wide operating system from scratch.")
+    _fact_runner(env, edited)
+    v = c.get("/api/impact-record", headers=H).json()["version"]
+    c.post("/api/impact-record/facts", headers=H, json={"text": fact, "version": v})
+    before = (run_dir / "resume-final.md").read_text()
+    r = c.post("/api/jobs/j1/resume/from-fact", headers=H, json={"fact": fact})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    p = body["proposal"]
+    assert [call.label for call in runner.calls] == ["resume-fact"]          # one pass, no re-rate
+    call = runner.calls[0]
+    assert call.model == env["cfg"].writer_model and call.candidate is True
+    assert "not a new résumé" in call.instructions and call.documents["confirmed-fact.md"] == fact
+    assert call.expect == ["reply.md"]
+    changed = [o for o in p["diff"] if o["op"] != "same"]
+    assert len(changed) == 1 and "keelhaul program" in changed[0]["new"] and "operating system" not in changed[0]["new"]
+    assert "Invented" not in (run_dir / "versions" / "proposal.md").read_text()
+    assert "left as they are" in p["changes"]
+    assert p["source"] == "fact" and p["honesty"]["passed"] is True and p["honesty"]["checked"] > 0
+    assert p["keywords_pct"] == 100.0 and p["rerated"] is False and p["ats_parts"]["keywords"] == 100.0
+    assert p["check"]["passed"] is True
+    assert before == (run_dir / "resume-final.md").read_text()                # nothing saved yet
+    saved = c.get("/api/jobs/j1/edit", headers=H).json()["proposal"]
+    assert saved["honesty"]["passed"] is True and any(o["op"] != "same" for o in saved["diff"])
+    h = c.post("/api/jobs/j1/edit/accept", headers=H).json()
+    assert h["current"] == 2 and h["versions"][-1]["source"] == "fact"
+    final = (run_dir / "resume-final.md").read_text()
+    assert "keelhaul program" in final and "Invented" not in final and "program management playbook" in final
+    v1 = next(v for v in c.get("/api/jobs/j1", headers=H).json()["resume"]["versions"] if v["n"] == 1)
+    assert v1["keywords_pct"] < 100.0
+
+
+def test_fact_update_flags_a_figure_the_fact_does_not_state(env):
+    c, run_dir = env["client"], env["run_dir"]
+    fact = "I ran the vendor migration at Northwind."
+    edited = _resume().replace(
+        "comparing three vendors on fees, uptime history and migration cost.",
+        "comparing three vendors on fees, uptime history and migration cost, and ran the vendor migration "
+        "at Northwind, cutting incidents by 41.7%.")
+    _fact_runner(env, edited)
+    r = c.post("/api/jobs/j1/resume/from-fact", headers=H, json={"fact": fact})
+    assert r.status_code == 200, r.text
+    p = r.json()["proposal"]
+    assert p["honesty"]["passed"] is False
+    assert any("41.7" in f["figures"] for f in p["honesty"]["flagged"])
+    assert "41.7%" in (run_dir / "versions" / "proposal.md").read_text()       # shown, and still yours to accept
+    assert c.post("/api/jobs/j1/edit/accept", headers=H).json()["current"] == 2
+
+
+def test_fact_update_drops_a_rewrite_the_fact_does_not_unlock(env):
+    c, run_dir = env["client"], env["run_dir"]
+    edited = _resume().replace(
+        "Wrote the platform's program management playbook (intake, prioritization, status, launch reviews), "
+        "now used by four other program managers.",
+        "Invented a company-wide operating system from scratch.")
+    _fact_runner(env, edited)
+    r = c.post("/api/jobs/j1/resume/from-fact", headers=H, json={"fact": "I ran the vendor migration at Northwind."})
+    assert r.status_code == 200, r.text
+    assert r.json()["proposal"] is None and "Nothing was kept" in r.json()["reply"]
+    assert not (run_dir / "versions" / "proposal.md").exists()
+    assert (run_dir / "resume-final.md").read_text() == _resume()
+    assert c.post("/api/jobs/j1/resume/from-fact", headers=H, json={"fact": "  "}).status_code == 400
+    assert c.post("/api/jobs/j2/resume/from-fact", headers=H, json={"fact": "I ran it."}).status_code == 404
+
+
 def test_add_confirmed_fact():
     from jobpipe.web.server import add_confirmed_fact
     day = date(2026, 10, 6)

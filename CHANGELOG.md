@@ -9,6 +9,7 @@ What changed in the app, newest first. Each release's notes on GitHub list what 
 
 ### Mac app
 - A notification when a résumé finishes; opening it shows that role
+- Test résumé notification, in the Job Oyster menu, posts that notification at once
 
 ### Finding jobs
 - Comeet and Workable postings are read, and a closed posting says so

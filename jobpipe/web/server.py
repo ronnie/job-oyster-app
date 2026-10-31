@@ -1368,6 +1368,16 @@ def create_app(cfg: Config, *, token: str, store: Optional[Store] = None,
             out.append({"id": run.id, "status": run.status, "jobs": jobs})
         return {"runs": out}
 
+    @app.get("/api/runs/notification-sample")
+    def notification_sample():
+        """One role for the Mac app's Test résumé notification. Nothing is run or saved."""
+        rows = [r for r in board.rows() if not r.get("dismissed")]
+        row = next((r for r in rows if r.get("tailored")), None) or (rows[0] if rows else None)
+        if not row:
+            return {"job": None}
+        return {"job": {"id": row.get("id") or "", "title": row.get("title") or "",
+                        "company": row.get("company") or ""}}
+
     @app.post("/api/runs/stop-all")
     def stop_all_runs():
         """Stop every run going and drop the waiting ones (`oyster restart --force`)."""

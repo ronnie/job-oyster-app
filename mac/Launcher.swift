@@ -5,7 +5,7 @@
 // and with it any runs going (a search, Make résumé); it asks first when there are some.
 // Clicking the Dock icon again opens the browser again. On start it checks GitHub for a newer release, and
 // Check for Updates… in the menu does so any time. When a résumé finishes, it posts a notification; opening
-// that notification shows the role.
+// that notification shows the role. Test résumé notification posts that same notification at once.
 import AppKit
 import Foundation
 import UserNotifications
@@ -89,15 +89,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
     }
 
-    func pollFinishedRuns() {
-        if pollBusy { return }
+    // A request to this app's own server, with the token from the page URL it opened.
+    func localAPI(_ pathAndQuery: String) -> URLRequest? {
         guard let u = url, let comps = URLComponents(url: u, resolvingAgainstBaseURL: false),
               let token = comps.queryItems?.first(where: { $0.name == "token" })?.value,
-              let api = URL(string: "http://127.0.0.1:\(comps.port ?? defaultPort)/api/runs/finished?after=\(finishedAfter())")
-        else { return }
+              let api = URL(string: "http://127.0.0.1:\(comps.port ?? defaultPort)\(pathAndQuery)")
+        else { return nil }
         var req = URLRequest(url: api)
         req.timeoutInterval = 8
         req.setValue(token, forHTTPHeaderField: "X-Jobpipe-Token")
+        return req
+    }
+
+    func pollFinishedRuns() {
+        if pollBusy { return }
+        guard let req = localAPI("/api/runs/finished?after=\(finishedAfter())") else { return }
         pollBusy = true
         let seeded = UserDefaults.standard.object(forKey: finishedRunKey) != nil
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
@@ -121,25 +127,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func announceFinished(_ runs: [[String: Any]]) {
         for run in runs {
             guard let id = run["id"] as? Int, let status = run["status"] as? String else { continue }
-            let jobs = run["jobs"] as? [[String: Any]] ?? []
-            let content = UNMutableNotificationContent()
-            let who = self.who(jobs.first)
-            if status == "done" {
-                content.title = jobs.count > 1 ? "\(jobs.count) résumés ready" : "Résumé ready"
-                if jobs.count > 1 {
-                    content.body = who.isEmpty ? "\(jobs.count) résumés are ready to read." : "\(who), and \(jobs.count - 1) more"
-                } else {
-                    content.body = who.isEmpty ? "A résumé is ready to read." : who
-                }
-            } else {
-                content.title = "Résumé didn't finish"
-                content.body = who.isEmpty ? "A résumé run stopped before it finished." : who
-            }
-            if let job = jobs.first?["id"] as? String, !job.isEmpty { content.userInfo = ["job": job] }
-            content.sound = .default
-            UNUserNotificationCenter.current().add(
-                UNNotificationRequest(identifier: "run-\(id)", content: content, trigger: nil))
+            postResumeNotice(status: status, jobs: run["jobs"] as? [[String: Any]] ?? [], identifier: "run-\(id)")
             UserDefaults.standard.set(id, forKey: finishedRunKey)
+        }
+    }
+
+    // The banner a finished résumé gets. A test uses its own identifier and leaves the finished-run cursor
+    // where it is, so trying the banner doesn't hide a résumé that finishes afterwards.
+    func postResumeNotice(status: String, jobs: [[String: Any]], identifier: String) {
+        let content = UNMutableNotificationContent()
+        let who = self.who(jobs.first)
+        if status == "done" {
+            content.title = jobs.count > 1 ? "\(jobs.count) résumés ready" : "Résumé ready"
+            if jobs.count > 1 {
+                content.body = who.isEmpty ? "\(jobs.count) résumés are ready to read." : "\(who), and \(jobs.count - 1) more"
+            } else {
+                content.body = who.isEmpty ? "A résumé is ready to read." : who
+            }
+        } else {
+            content.title = "Résumé didn't finish"
+            content.body = who.isEmpty ? "A résumé run stopped before it finished." : who
+        }
+        if let job = jobs.first?["id"] as? String, !job.isEmpty { content.userInfo = ["job": job] }
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
+    }
+
+    // Posts the "Résumé ready" banner now, named for one role already on the board. Nothing is tailored.
+    @objc func testNotification(_ sender: Any?) {
+        guard let req = localAPI("/api/runs/notification-sample") else {
+            tell("Job Oyster isn't open yet", "Wait until it opens in the browser, then try the test notification again.")
+            return
+        }
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, _ in
+            guard let self = self else { return }
+            var jobs: [[String: Any]] = []
+            if (resp as? HTTPURLResponse)?.statusCode == 200, let data = data,
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let job = obj["job"] as? [String: Any] {
+                jobs = [job]
+            }
+            self.deliverTestNotification(jobs)
+        }.resume()
+    }
+
+    func deliverTestNotification(_ jobs: [[String: Any]]) {
+        let post = { [weak self] in
+            self?.postResumeNotice(status: "done", jobs: jobs,
+                                   identifier: "test-\(Int(Date().timeIntervalSince1970))")
+        }
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            guard let self = self else { return }
+            switch settings.authorizationStatus {
+            case .authorized, .provisional:
+                DispatchQueue.main.async(execute: post)
+            case .denied:
+                self.tell("Notifications are off for Job Oyster",
+                          "Turn them on in System Settings → Notifications, then choose Test résumé notification again.")
+            default:
+                UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, _ in
+                    if ok { DispatchQueue.main.async(execute: post) }
+                    else {
+                        self.tell("Notifications are off for Job Oyster",
+                                  "Turn them on in System Settings → Notifications, then choose Test résumé notification again.")
+                    }
+                }
+            }
         }
     }
 
@@ -336,6 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         main.addItem(appItem)
         let m = NSMenu()
         m.addItem(withTitle: "Open Job Oyster", action: #selector(openInBrowser(_:)), keyEquivalent: "o")
+        m.addItem(withTitle: "Test résumé notification", action: #selector(testNotification(_:)), keyEquivalent: "")
         m.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates(_:)), keyEquivalent: "")
         m.addItem(.separator())
         m.addItem(withTitle: "Show Profile Folder", action: #selector(showProfile(_:)), keyEquivalent: "")
@@ -346,6 +401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.mainMenu = main
         let dock = NSMenu()
         dock.addItem(withTitle: "Open Job Oyster", action: #selector(openInBrowser(_:)), keyEquivalent: "")
+        dock.addItem(withTitle: "Test résumé notification", action: #selector(testNotification(_:)), keyEquivalent: "")
         dock.addItem(withTitle: "Show Profile Folder", action: #selector(showProfile(_:)), keyEquivalent: "")
         dock.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates(_:)), keyEquivalent: "")
         dockMenu = dock

@@ -2463,6 +2463,14 @@ def test_ready_to_send_lists_resumes_questions_referrals_and_closed_postings(env
     assert c.get("/api/runs/finished?after=10", headers=H).json()["runs"] == []
 
 
+def test_notification_sample_names_one_role_and_runs_nothing(env):
+    c = env["client"]
+    assert c.get("/api/runs/notification-sample").status_code == 401
+    job = c.get("/api/runs/notification-sample", headers=H).json()["job"]
+    assert job == {"id": "j1", "title": TITLE, "company": "Acme"}
+    assert c.get("/api/runs", headers=H).json()["runs"] == []
+
+
 def test_setup_wizard_stays_shut_for_a_saved_profile(env):
     c = env["client"]
     prof = c.get("/api/profile", headers=H).json()

@@ -16,7 +16,7 @@ Searches (the **Filters** tab): **Check filters** (≤1 credit per filter), **Se
 
 ## Starting and stopping it (when you run it from the code)
 
-The Mac app needs none of this: open it from Applications, and quit it with ⌘Q. When a résumé finishes, it notifies you, and opening the notification shows that role.
+The Mac app needs none of this: open it from Applications, and quit it with ⌘Q. When a résumé finishes, it notifies you, and opening the notification shows that role. To see that notification without waiting for a résumé, choose **Test résumé notification** from the Job Oyster menu (or the Dock icon's menu).
 
 ```bash
 ./oyster install      # once: makes `oyster` work from any folder
